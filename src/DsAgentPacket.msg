@@ -1,0 +1,14 @@
+import inet.common.packet.chunk.Chunk;
+
+namespace src;
+
+class DsHelloPacket extends inet::FieldsChunk
+{
+    @packetData;
+    string senderAddress;
+    int state;
+    string neighbors[];
+    double positionX;
+    double positionY;
+    double positionZ;
+}
