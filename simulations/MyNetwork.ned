@@ -16,8 +16,6 @@
 // MyNetwork.ned
 //
 
-//package simulations;
-
 import inet.node.inet.ManetRouter;
 import inet.networklayer.configurator.ipv4.Ipv4NetworkConfigurator;
 import inet.physicallayer.wireless.ieee80211.packetlevel.Ieee80211ScalarRadioMedium;
@@ -25,6 +23,7 @@ import inet.visualizer.canvas.integrated.IntegratedCanvasVisualizer;
 import inet.environment.common.PhysicalEnvironment;
 
 import DominatingSetAgent;
+import Observer;
 
 network MyManet
 {
@@ -36,22 +35,26 @@ network MyManet
 
     submodules:
         configurator: Ipv4NetworkConfigurator {
-            @display("p=500,50");
+            @display("p=50,50");
         }
 
         radioMedium: Ieee80211ScalarRadioMedium {
-            @display("p=500,150");
+            @display("p=50,100");
         }
 
         physicalEnvironment: PhysicalEnvironment {
-            @display("p=500,200");
+            @display("p=50,150");
         }
 
         visualizer: IntegratedCanvasVisualizer {
-            @display("p=500,250");
+            @display("p=50,200");
         }
 
         host[numHosts]: ManetRouter {
-            @display("p=150,150,m,10,1000,1000");
+        }
+
+        observer: Observer {
+            interval = 10s;
+            @display("p=50,250");
         }
 }

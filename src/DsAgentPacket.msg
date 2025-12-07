@@ -8,7 +8,4 @@ class DsHelloPacket extends inet::FieldsChunk
     string senderAddress;
     int state;
     string neighbors[];
-    double positionX;
-    double positionY;
-    double positionZ;
 }
