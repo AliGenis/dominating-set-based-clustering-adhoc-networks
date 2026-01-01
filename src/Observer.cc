@@ -14,7 +14,7 @@ class Observer : public cSimpleModule {
     simsignal_t globalCHSignal;
     
     simsignal_t globalClusterHeadFairnessSignal;
-
+    
     simsignal_t globalClusterCountSignal;
     simsignal_t globalClusterSizeMeanSignal;
     simsignal_t globalClusterStabilityAvgTimeSignal;
@@ -27,13 +27,15 @@ class Observer : public cSimpleModule {
     simsignal_t globalEndToEndDelaySignal;
     simsignal_t globalPacketDeliveryRatioSignal;
     
+    simsignal_t globalEnergyConsumptionVarianceSignal;
     simsignal_t globalEnergyConsumptionSignal;
     simsignal_t globalLoadBalanceSignal;
     simsignal_t globalNetworkLifetimeSignal;
     
     cMessage *timerMsg;
     double interval;
-
+    simtime_t startTime;
+    
     std::map<cModule*, L3Address> previousClusterHeads;
     std::map<cModule*, simtime_t> lastMembershipChangeTime;
     std::map<cModule*, simtime_t> totalStableTime;
@@ -50,7 +52,7 @@ class Observer : public cSimpleModule {
 Define_Module(Observer);
 
 void Observer::initialize() {
-    
+    globalCHSignal = registerSignal("globalCHCount");
     globalClusterHeadFairnessSignal = registerSignal("globalClusterHeadFairness");
     
     globalClusterCountSignal = registerSignal("globalClusterCount");
@@ -64,12 +66,14 @@ void Observer::initialize() {
     globalThroughputSignal = registerSignal("globalThroughput");
     globalEndToEndDelaySignal = registerSignal("globalEndToEndDelay");
     globalPacketDeliveryRatioSignal = registerSignal("globalPacketDeliveryRatio");
-
+    
+    globalEnergyConsumptionVarianceSignal = registerSignal("globalEnergyConsumptionVariance");
     globalEnergyConsumptionSignal = registerSignal("globalEnergyConsumption");
     globalLoadBalanceSignal = registerSignal("globalLoadBalance");
     globalNetworkLifetimeSignal = registerSignal("globalNetworkLifetime");
     
     interval = par("interval");
+    startTime = par("startTime");
     
     firstNodeDeathTime = -1.0;
     firstNodeDied = false;
@@ -80,6 +84,10 @@ void Observer::initialize() {
 
 void Observer::handleMessage(cMessage *msg) {
     if (msg == timerMsg) {
+        if (simTime() < startTime) {
+            scheduleAt(simTime() + interval, timerMsg);
+            return;
+        }
         cModule *network = getParentModule();
         
         int chCounter = 0;
@@ -91,14 +99,14 @@ void Observer::handleMessage(cMessage *msg) {
         int nodeCount = 0;
         
         std::vector<int> clusterSizes;
-
+        
         std::vector<double> clusterHeadLifetimes;
         
         long nodesWithStableMembership = 0;
         
         for (cModule::SubmoduleIterator it(network); !it.end(); ++it) {
             cModule *sub = *it;
-
+            
             const char *subName = sub->getName();
             if (subName == nullptr || strncmp(subName, "host", 4) != 0) {
                 continue;
@@ -144,16 +152,17 @@ void Observer::handleMessage(cMessage *msg) {
                         }
                         previousClusterHeads[sub] = currentCH;
                         
-                        int clusterSize = agent->getClusterSize();
-                        clusterSizes.push_back(clusterSize);
+                        
                         
                         if (agent->amIClusterHead()) {
                             simtime_t currentLifetime = agent->getCurrentClusterHeadLifetime();
                             if (currentLifetime > 0) {
                                 clusterHeadLifetimes.push_back(currentLifetime.dbl());
                             }
+                            int clusterSize = agent->getClusterSize();
+                            clusterSizes.push_back(clusterSize);
                         }
-
+                        
                         simtime_t chTime = agent->getTotalClusterHeadTime();
                         if (simTime() > 0) {
                             totalClusterHeadTime += chTime.dbl() / simTime().dbl();
@@ -166,7 +175,7 @@ void Observer::handleMessage(cMessage *msg) {
                 }
             }
         }
-
+        
         int globalClusterCount = allClusterHeads.size();
         if (globalClusterCount == 0 && chCounter > 0) {
             globalClusterCount = chCounter;
@@ -175,10 +184,11 @@ void Observer::handleMessage(cMessage *msg) {
         double avgFairness = (nodeCount > 0) ? (totalClusterHeadTime / nodeCount) : 0.0;
         double avgControlOverhead = (nodeCount > 0) ? (static_cast<double>(totalControlOverhead) / nodeCount) : 0.0;
         double avgReclusteringFrequency = (nodeCount > 0) ? (static_cast<double>(totalReclusteringCount) / nodeCount) : 0.0;
-        
+
         double totalThroughput = 0.0;
         double totalDelay = 0.0;
-        double totalPDR = 0.0;
+        long globalPacketsSent = 0;
+        long globalPacketsReceived = 0;
         int nodesWithData = 0;
         
         
@@ -195,12 +205,13 @@ void Observer::handleMessage(cMessage *msg) {
                     if (agent) {
                         double throughput = agent->getThroughput();
                         double delay = agent->getAverageDelay();
-                        double pdr = agent->getPacketDeliveryRatio();
                         
-                        if (throughput > 0 || delay > 0 || pdr > 0) {
+                        globalPacketsSent += agent->getPacketsSent();
+                        globalPacketsReceived += agent->getPacketsReceived();
+                        
+                        if (throughput > 0 || delay > 0) {
                             totalThroughput += throughput;
                             totalDelay += delay;
-                            totalPDR += pdr;
                             nodesWithData++;
                         }
                     }
@@ -210,7 +221,7 @@ void Observer::handleMessage(cMessage *msg) {
         
         double avgThroughput = (nodesWithData > 0) ? (totalThroughput / nodesWithData) : 0.0;
         double avgDelay = (nodesWithData > 0) ? (totalDelay / nodesWithData) : 0.0;
-        double avgPDR = (nodesWithData > 0) ? (totalPDR / nodesWithData) : 0.0;
+        double avgPDR = (globalPacketsSent > 0) ? (static_cast<double>(globalPacketsReceived) / globalPacketsSent) : 0.0;
         
         double totalEnergy = 0.0;
         int aliveNodes = 0;
@@ -245,22 +256,27 @@ void Observer::handleMessage(cMessage *msg) {
                 }
             }
         }
-        
         double avgEnergy = (nodeCount > 0) ? (totalEnergy / nodeCount) : 0.0;
+        
+        double energyVariance = 0.0;
+        if (!energyValues.empty() && energyValues.size() > 1) {
+            double sumSquaredDiff = 0.0;
+            for (double energy : energyValues) {
+                double diff = energy - avgEnergy;
+                sumSquaredDiff += diff * diff;
+            }
+            energyVariance = sumSquaredDiff / (energyValues.size() - 1);
+        }
         
         // Lower is better
         double loadBalance = 0.0;
         if (!energyValues.empty() && avgEnergy > 0) {
-            double variance = 0.0;
-            for (double energy : energyValues) {
-                variance += (energy - avgEnergy) * (energy - avgEnergy);
-            }
-            double stdDev = (energyValues.size() > 1) ? sqrt(variance / (energyValues.size() - 1)) : 0.0;
+            double stdDev = sqrt(energyVariance);
             loadBalance = (avgEnergy > 0) ? (stdDev / avgEnergy) : 0.0;
         }
         
         double networkLifetime = firstNodeDied ? firstNodeDeathTime.dbl() : simTime().dbl();
-
+        
         double clusterSizeMean = 0.0;
         if (!clusterSizes.empty()) {
             double sum = 0.0;
@@ -286,7 +302,7 @@ void Observer::handleMessage(cMessage *msg) {
         } else if (nodeCount > 0 && nodesWithStableMembership > 0) {
             avgStableTime = simTime().dbl();
         }
-
+        
         double chLifetimeMean = 0.0;
         if (!clusterHeadLifetimes.empty()) {
             double sum = 0.0;
@@ -295,7 +311,7 @@ void Observer::handleMessage(cMessage *msg) {
             }
             chLifetimeMean = sum / clusterHeadLifetimes.size();
         }
-        emit(globalClusterCountSignal, globalClusterCount);
+        emit(globalClusterCountSignal, chCounter);
         emit(globalClusterHeadFairnessSignal, avgFairness);
         
         emit(globalClusterSizeMeanSignal, clusterSizeMean);
@@ -308,11 +324,12 @@ void Observer::handleMessage(cMessage *msg) {
         emit(globalThroughputSignal, avgThroughput);
         emit(globalEndToEndDelaySignal, avgDelay);
         emit(globalPacketDeliveryRatioSignal, avgPDR);
-
+        
+        emit(globalEnergyConsumptionVarianceSignal, energyVariance);
         emit(globalEnergyConsumptionSignal, avgEnergy);
         emit(globalLoadBalanceSignal, loadBalance);
         emit(globalNetworkLifetimeSignal, networkLifetime);
-
+        
         scheduleAt(simTime() + interval, timerMsg);
     }
 }

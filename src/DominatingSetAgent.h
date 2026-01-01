@@ -16,6 +16,7 @@
  #include "inet/common/packet/Packet.h"
  #include "inet/common/geometry/common/Coord.h"
  #include "inet/mobility/contract/IMobility.h"
+ #include <chrono>
  
  #include "DsAgentPacket_m.h"
  
@@ -27,7 +28,7 @@
      STATE_GRAY = 1,   // Candidate CH
      STATE_BLACK = 2   // CH
  };
-
+ 
  struct NeighborInfo {
      simtime_t lastHeard;
      NodeState state = STATE_WHITE;
@@ -58,20 +59,22 @@
  
      INetfilter *networkProtocol = nullptr;
      bool hookRegistered = false;
-
-     std::map<L3Address, NeighborInfo> neighborTable;
  
+     std::map<L3Address, NeighborInfo> neighborTable;
+     
      ClusterInfo myClusterInfo;
      L3Address previousClusterHead;
      simtime_t clusterHeadStartTime;
      int timesAsClusterHead = 0;
      simtime_t totalClusterHeadTime = 0.0;
- 
+     
      simtime_t lastReclusteringTime = 0.0;
      int reclusteringCount = 0;
- 
+     
      simtime_t lastAlgorithmStartTime = 0.0;
-
+     std::chrono::high_resolution_clock::time_point algorithmStartWallTime;
+     double totalComputationTime = 0.0;
+ 
      double helloInterval = 1.0;
      double algorithmInterval = 5.0;
      double neighborPurgeTimeout = 10.0;
@@ -80,11 +83,13 @@
      int destPort = 5000;
  
      simsignal_t computationCostSignal;
- 
+     simsignal_t energyConsumptionSignal;
+     simsignal_t endToEndDelaySignal;
+     
      long helloReceivedCount = 0;
      long backboneRoutedCount = 0;
      long controlOverheadCount = 0;
- 
+     
      long packetsSent = 0;
      long packetsReceived = 0;
      long bytesSent = 0;
@@ -119,7 +124,7 @@
      virtual void purgeNeighborTable();
      virtual void setState(NodeState newState);
      virtual void updateNodeVisualization();
- 
+     
      virtual void updateClusterMembership();
      virtual int calculateClusterSize() const;
      virtual void trackComputationCost();
@@ -141,12 +146,12 @@
    public:
      DominatingSetAgent() {}
      virtual ~DominatingSetAgent();
- 
+     
      // For observer
      NodeState getState() const { return myState; }
      bool amIClusterHead() const { return myState == STATE_BLACK; }
      L3Address getMyClusterHead() const { return findMyClusterHead(); }
- 
+     
      simtime_t getTotalClusterHeadTime() const { return totalClusterHeadTime; }
      int getMembershipChanges() const { return myClusterInfo.membershipChanges; }
      int getReclusteringCount() const { return reclusteringCount; }
@@ -154,14 +159,16 @@
      L3Address getMyAddress() const { return myAddress; }
      int getClusterSize() const { return calculateClusterSize(); }
      simtime_t getCurrentClusterHeadLifetime() const;
-
+     
+     long getPacketsSent() const { return packetsSent; }
+     long getPacketsReceived() const { return packetsReceived; }
      double getThroughput() const;
      double getAverageDelay() const;
      double getPacketDeliveryRatio() const;
-
+     
      double getEnergyConsumption() const;
      bool isNodeAlive() const;
-
+     
      std::set<L3Address> getClusterHeads() const;
  };
  

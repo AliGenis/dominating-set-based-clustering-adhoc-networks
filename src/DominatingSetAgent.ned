@@ -30,8 +30,12 @@ simple DominatingSetAgent like inet.applications.contract.IApp
         int destPort = default(5000);
 
         @signal[computationCost](type=double);
+        @signal[energyConsumption](type=double);
+        @signal[endToEndDelay](type=double);
 
         @statistic[computationCost](title="Computation Cost"; source=computationCost; record=mean,sum,vector);
+        @statistic[energyConsumption](title="Energy Consumption (Per Node)"; source=energyConsumption; record=last,vector);
+        @statistic[endToEndDelay](title="End To End Delay (Per Packet in ms)"; source=endToEndDelay; record=mean, vector);
 
     gates:
         input socketIn @labels(UdpControlInfo/up);

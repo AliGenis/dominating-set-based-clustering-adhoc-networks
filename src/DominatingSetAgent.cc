@@ -8,12 +8,20 @@
  #include "inet/networklayer/ipv4/Ipv4InterfaceData.h"
  #include "inet/networklayer/ipv4/Ipv4Header_m.h"
  #include "inet/common/Units.h"
+ #include "inet/power/contract/IEpEnergyStorage.h"
+ #include "inet/power/contract/ICcEnergyStorage.h"
  #include "inet/transportlayer/common/L4PortTag_m.h"
  #include "inet/networklayer/common/HopLimitTag_m.h"
  #include "inet/networklayer/common/NextHopAddressTag_m.h"
  #include "inet/mobility/contract/IMobility.h"
  #include <climits>
  #include <limits>
+ #include "inet/power/contract/IEnergyStorage.h"
+ #include "inet/power/contract/ICcEnergyStorage.h"
+ #include "inet/common/Units.h"
+ 
+ using namespace inet::units::values;
+ using namespace inet::power;
  
  Define_Module(DominatingSetAgent);
  
@@ -78,18 +86,20 @@
          socket.setCallback(this);
          socket.setOutputGate(gate("socketOut"));
          bindSocket();
- 
+         
          registerNetfilterHook();
  
          simtime_t firstHelloTime = simTime() + uniform(0, helloInterval);
          simtime_t firstAlgoTime = simTime() + uniform(0, algorithmInterval);
          scheduleAt(firstHelloTime, helloTimer);
          scheduleAt(firstAlgoTime, algorithmTimer);
-         EV_INFO << "Node " << myAddress << " scheduled first HELLO at " << firstHelloTime
+         EV_INFO << "Node " << myAddress << " scheduled first HELLO at " << firstHelloTime 
                  << ", first algorithm run at " << firstAlgoTime << endl;
  
          computationCostSignal = registerSignal("computationCost");
- 
+         energyConsumptionSignal = registerSignal("energyConsumption");
+         endToEndDelaySignal = registerSignal("endToEndDelay");
+         
          previousClusterHead = L3Address();
          clusterHeadStartTime = -1.0;
      }
@@ -98,11 +108,11 @@
  void DominatingSetAgent::registerNetfilterHook()
  {
      if (hookRegistered) return;
- 
+     
      cModule *host = getContainingNode(this);
- 
+     
      cModule *ipv4Module = nullptr;
- 
+     
      cModule *networkLayer = host->getSubmodule("ipv4");
      if (networkLayer) {
          ipv4Module = networkLayer->getSubmodule("ip");
@@ -145,16 +155,24 @@
      L3Address source = networkHeader->getSrcAddress();
      L3Address destination = networkHeader->getDestAddress();
      std::string packetName = datagram->getName();
- 
-     if (source == myAddress && !destination.isBroadcast() && !destination.isMulticast() &&
+     
+     if (/*source == myAddress && */!destination.isBroadcast() && !destination.isMulticast() && 
          !isControlPacket(packetName) && !isRoutingPacket(packetName)) {
          packetsSent++;
          bytesSent += datagram->getTotalLength().get();
-
+         
          long packetId = datagram->getId();
          packetSendTimes[packetId] = simTime();
-     }
  
+         if (packetName.find("_TS") == std::string::npos) {
+             char buffer[200];
+             snprintf(buffer, sizeof(buffer), "%s_TS%.9f", packetName.c_str(), simTime().dbl());
+             datagram->setName(buffer);
+             
+             EV_INFO << "Tagged packet with send time: " << buffer << endl;
+         }
+     }
+     
      if (myState == STATE_WHITE) {
          L3Address myCH = findMyClusterHead();
          if (!myCH.isUnspecified()) {
@@ -186,27 +204,51 @@
      if(myState != STATE_BLACK && isRoutingPacket(datagram->getName())) {
          return DROP;
      }
- 
+     
      if (destination.isBroadcast() || destination.isMulticast()) {
          return ACCEPT;
      }
  
      if (destination == myAddress) {
          EV_INFO << "*** HOOK PRE_ROUTING: Packet arrived at destination " << myAddress << " ***" << endl;
- 
+         
          std::string packetName = datagram->getName();
          if (!isControlPacket(packetName) && !isRoutingPacket(packetName)) {
              packetsReceived++;
              bytesReceived += datagram->getTotalLength().get();
- 
-             long packetId = datagram->getId();
-             auto it = packetSendTimes.find(packetId);
-             if (it != packetSendTimes.end()) {
-                 simtime_t delay = simTime() - it->second;
-                 if (delay >= 0) {
-                     totalDelay += delay.dbl();
+             
+             size_t pos = packetName.find("_TS");
+             if (pos != std::string::npos) {
+                 try {
+                     std::string timeStr = packetName.substr(pos + 3);
+                     
+                     size_t endPos = 0;
+                     for (size_t i = 0; i < timeStr.length(); i++) {
+                         char c = timeStr[i];
+                         if ((c >= '0' && c <= '9') || c == '.') {
+                             endPos = i + 1;
+                         } else {
+                             break;
+                         }
+                     }
+                     
+                     if (endPos > 0) {
+                         timeStr = timeStr.substr(0, endPos);
+                         double sendTime = std::stod(timeStr);
+                         double delay = simTime().dbl() - sendTime;
+                         
+                         if (delay >= 0) {
+                             totalDelay += delay;
+                             emit(endToEndDelaySignal, delay*1000);
+                         } else {
+                             EV_WARN << "Negative delay detected: " << delay << endl;
+                         }
+                     }
+                 } catch (const std::exception& e) {
+                     EV_WARN << "Error parsing timestamp from packet name: " << e.what() << endl;
                  }
-                 packetSendTimes.erase(it);
+             } else {
+                 EV_INFO << "No timestamp in packet name: " << packetName << endl;
              }
  
              simtime_t cleanupTime = simTime() - 10.0;
@@ -220,20 +262,20 @@
          }
          return ACCEPT;
      }
- 
+     
      std::string packetName = datagram->getName();
      if (isControlPacket(packetName)) {
          return ACCEPT;
      }
- 
+     
      const char* stateNames[] = {"MEMBER", "GRAY", "CH"};
-     EV_INFO << "*** HOOK PRE_ROUTING: " << stateNames[myState] << " " << myAddress
+     EV_INFO << "*** HOOK PRE_ROUTING: " << stateNames[myState] << " " << myAddress 
              << " received '" << packetName << "' from " << source << " to " << destination << " ***" << endl;
- 
+     
      if (myState != STATE_BLACK) {
          L3Address myCH = findMyClusterHead();
-         EV_WARN << "*** HOOK PRE_ROUTING: Member " << myAddress
-                     << " redirecting forwarded packet to CH " << myCH
+         EV_WARN << "*** HOOK PRE_ROUTING: Member " << myAddress 
+                     << " redirecting forwarded packet to CH " << myCH 
                      << " from " << source << " to " << destination
                      << " (members don't forward) ***" << endl;
          return DROP;
@@ -247,13 +289,13 @@
      if (myState == STATE_BLACK) {
          auto networkHeader = datagram->peekAtFront<Ipv4Header>();
          L3Address destination = networkHeader->getDestAddress();
-
+ 
          L3Address myCalculatedNextHop = getNextHopForDestination(destination);
  
          if (!myCalculatedNextHop.isUnspecified()) {
               datagram->removeTagIfPresent<NextHopAddressReq>();
               datagram->addTag<NextHopAddressReq>()->setNextHopAddress(myCalculatedNextHop);
- 
+              
               EV_INFO << "CH Override: Forcing packet to backbone neighbor: " << myCalculatedNextHop << endl;
          }
      }
@@ -267,24 +309,24 @@
      L3Address destination = networkHeader->getDestAddress();
      L3Address source = networkHeader->getSrcAddress();
      if (source != myAddress && myState != STATE_BLACK) return DROP;
- 
+     
      if (destination.isBroadcast() || destination.isMulticast() || destination == myAddress) {
          return ACCEPT;
      }
- 
+     
      std::string packetName = datagram->getName();
      if (isControlPacket(packetName)) {
          return ACCEPT;
      }
- 
+     
      auto nextHopTag = datagram->findTag<NextHopAddressReq>();
      if (!nextHopTag) {
          EV_ERROR << "*** POST_ROUTING: No next hop set yet, allowing protocol route ***" << endl;
          return ACCEPT;
      }
- 
+     
      L3Address protocolNextHop = nextHopTag->getNextHopAddress();
- 
+     
      if (protocolNextHop == destination) {
          if (isNeighbor(destination)) {
              auto destIt = neighborTable.find(destination);
@@ -293,17 +335,17 @@
              }
          }
      }
- 
+     
      if (!protocolNextHop.isUnspecified() && protocolNextHop != destination) {
          auto nextHopIt = neighborTable.find(protocolNextHop);
          if (nextHopIt != neighborTable.end()) {
              bool isBackboneNode = (nextHopIt->second.state == STATE_BLACK);
              if (!isBackboneNode) {
-                 EV_INFO << "*** POST_ROUTING: Routing protocol chose non-backbone " << protocolNextHop
+                 EV_INFO << "*** POST_ROUTING: Routing protocol chose non-backbone " << protocolNextHop 
                          << ", overriding to use CH/Gateway backbone ***" << endl;
- 
+                 
                  L3Address bestBackbone;
- 
+                 
                  if (bestBackbone.isUnspecified()) {
                      for (const auto& pair : neighborTable) {
                          if (pair.second.state == STATE_BLACK) {
@@ -312,9 +354,9 @@
                          }
                      }
                  }
- 
+                 
                  if (!bestBackbone.isUnspecified()) {
-                     EV_INFO << "*** POST_ROUTING: Redirecting to backbone node " << bestBackbone
+                     EV_INFO << "*** POST_ROUTING: Redirecting to backbone node " << bestBackbone 
                              << " instead of non-backbone " << protocolNextHop << " ***" << endl;
                      datagram->removeTag<NextHopAddressReq>();
                      datagram->addTag<NextHopAddressReq>()->setNextHopAddress(bestBackbone);
@@ -322,27 +364,27 @@
                      EV_ERROR << "*** POST_ROUTING: No backbone node (CH/Gateway) found, allowing protocol route ***" << endl;
                  }
              } else {
-                 EV_DEBUG << "*** POST_ROUTING: Routing protocol chose backbone node " << protocolNextHop
+                 EV_DEBUG << "*** POST_ROUTING: Routing protocol chose backbone node " << protocolNextHop 
                           << " - OK ***" << endl;
              }
          } else {
-             EV_DEBUG << "*** POST_ROUTING: Next hop " << protocolNextHop
+             EV_DEBUG << "*** POST_ROUTING: Next hop " << protocolNextHop 
                       << " not in neighbor table - allowing protocol route ***" << endl;
          }
      }
- 
+     
      return ACCEPT;
  }
  
  L3Address DominatingSetAgent::getNextHopForDestination(const L3Address& destination)
  {
      const char* stateNames[] = {"MEMBER", "GRAY", "CH"};
-     EV_DEBUG << "ROUTING: Node " << myAddress << " (" << stateNames[myState]
+     EV_DEBUG << "ROUTING: Node " << myAddress << " (" << stateNames[myState] 
              << ") finding next hop to " << destination << endl;
-
+     
      if (myState != STATE_BLACK) {
          L3Address myCH = findMyClusterHead();
- 
+         
          if (myCH.isUnspecified()) {
              EV_ERROR << "*** ROUTING ERROR: Member " << myAddress << " has no cluster head! ***" << endl;
              return L3Address();
@@ -353,7 +395,7 @@
          if (isNeighbor(destination)) {
              auto destIt = neighborTable.find(destination);
              if (destIt != neighborTable.end()) {
-                 EV_INFO << "*** ROUTING: CH " << myAddress << " -> Member " << destination
+                 EV_INFO << "*** ROUTING: CH " << myAddress << " -> Member " << destination 
                          << " (final delivery to my member) ***" << endl;
                  return destination;
              }
@@ -372,15 +414,18 @@
          }
          else if (msg == algorithmTimer) {
              lastAlgorithmStartTime = simTime();
+             algorithmStartWallTime = std::chrono::high_resolution_clock::now();
              runClusteringAlgorithm();
              updateClusterMembership();
              updateNodeVisualization();
              trackComputationCost();
+ 
+             double energy = getEnergyConsumption();
+             emit(energyConsumptionSignal, energy);
              scheduleAt(simTime() + algorithmInterval, algorithmTimer);
          }
      }
      else {
-        EV_INFO << "Socket handled message(handleMessageWhenUp): " << msg->getName() << endl;
          socket.processMessage(msg);
      }
  }
@@ -402,7 +447,7 @@
      }
  
      const char* stateNames[] = {"WHITE", "GRAY", "BLACK"};
-     EV_DEBUG << "*** DS-HELLO RECEIVED: Node " << myAddress << " got HELLO from " << sender
+     EV_DEBUG << "*** DS-HELLO RECEIVED: Node " << myAddress << " got HELLO from " << sender 
              << " (state=" << stateNames[payload->getState()] << ") ***" << endl;
  
      NeighborInfo& info = neighborTable[sender];
@@ -424,6 +469,8 @@
  
  void DominatingSetAgent::finish()
  {
+     recordScalar("helloReceivedCount", helloReceivedCount);
+     recordScalar("backboneRoutedCount", backboneRoutedCount);
      ApplicationBase::finish();
  }
  
@@ -434,7 +481,7 @@
          bindSocket();
      }
  
-     EV_INFO << "*** DS-HELLO: Node " << myAddress << " broadcasting HELLO (State: " << myState
+     EV_INFO << "*** DS-HELLO: Node " << myAddress << " broadcasting HELLO (State: " << myState 
              << ", neighbors: " << neighborTable.size() << ") ***" << endl;
  
      auto payload = makeShared<DsHelloPacket>();
@@ -447,12 +494,12 @@
      for (const auto& addr : neighbors) {
          payload->setNeighbors(i++, addr.str().c_str());
      }
- 
+     
      payload->setChunkLength(B(32 + 4 * neighborTable.size()));
  
      controlOverheadCount++;
      Packet *packet = new Packet("DsHello", payload);
- 
+     
      if (wirelessInterfaceId >= 0) {
          packet->addTag<InterfaceReq>()->setInterfaceId(wirelessInterfaceId);
      }
@@ -460,7 +507,7 @@
      L3Address destAddr = Ipv4Address::ALLONES_ADDRESS;
      packet->addTag<L3AddressReq>()->setDestAddress(destAddr);
      packet->addTag<L4PortReq>()->setDestPort(destPort);
- 
+     
      try {
          socket.send(packet);
      }
@@ -506,22 +553,22 @@
  void DominatingSetAgent::runClusteringAlgorithm()
  {
      std::set<L3Address> myNeighbors = getMyOneHopNeighbors();
- 
+     
      int blackNeighbors = 0, grayNeighbors = 0, whiteNeighbors = 0;
      for (const auto& pair : neighborTable) {
          if (pair.second.state == STATE_BLACK) blackNeighbors++;
          else if (pair.second.state == STATE_GRAY) grayNeighbors++;
          else whiteNeighbors++;
      }
- 
+     
      double warmupTime = 3 * helloInterval;
      if (simTime() < warmupTime) {
          EV_WARN << "*** ALGO: Node " << myAddress << " in warmup period, not making CH decisions yet ***" << endl;
          return;
      }
- 
-     EV_DEBUG << "ALGO: Node " << myAddress << " running algorithm. Neighbors: "
-             << myNeighbors.size() << " (BLACK:" << blackNeighbors
+     
+     EV_DEBUG << "ALGO: Node " << myAddress << " running algorithm. Neighbors: " 
+             << myNeighbors.size() << " (BLACK:" << blackNeighbors 
              << " GRAY:" << grayNeighbors << " WHITE:" << whiteNeighbors << ")" << endl;
  
      NodeState newState = STATE_WHITE;
@@ -568,26 +615,6 @@
  
      if (newState == STATE_GRAY) {
          newState = STATE_BLACK;
-         /*TODO: I think this is not valid in this design
-         bool lowerIdCandidate = false;
-         for (const auto& neighbor : myNeighbors) {
-             if (neighbor.toIpv4().getInt() < myId) {
-                 auto it = neighborTable.find(neighbor);
-                 if (it != neighborTable.end() &&
-                     (it->second.state == STATE_GRAY || it->second.state == STATE_BLACK)) {
-                     lowerIdCandidate = true;
-                     break;
-                 }
-             }
-         }
- 
-         if (lowerIdCandidate) {
-             EV_INFO << "Node " << myAddress << " deferring to lower-ID candidate neighbor" << endl;
-             newState = STATE_WHITE;
-         } else {
-             newState = STATE_BLACK;
-         }
-         */
      }
  
      if (newState != STATE_BLACK) {
@@ -602,9 +629,9 @@
                  break;
              }
          }
- 
+         
          if (neighborHasBlack) {
-             EV_WARN << "*** ALGO: Node " << myAddress << " has BLACK neighbor "
+             EV_WARN << "*** ALGO: Node " << myAddress << " has BLACK neighbor " 
                      << blackNeighborAddr << ", staying WHITE ***" << endl;
          } else if (!neighbors.empty()) {
              bool lowestId = true;
@@ -629,13 +656,13 @@
  {
      bool wasClusterHead = (myState == STATE_BLACK);
      bool isNowClusterHead = (newState == STATE_BLACK);
- 
+     
      if (myState != newState) {
          const char* stateNames[] = {"WHITE", "GRAY", "BLACK"};
-         EV_WARN << "*** STATE CHANGE: Node " << myAddress << " "
-                 << stateNames[myState] << " -> " << stateNames[newState]
+         EV_WARN << "*** STATE CHANGE: Node " << myAddress << " " 
+                 << stateNames[myState] << " -> " << stateNames[newState] 
                  << (isNowClusterHead ? " [CLUSTER HEAD]" : "") << " ***" << endl;
- 
+         
          if (wasClusterHead && !isNowClusterHead) {
              if (clusterHeadStartTime >= 0) {
                  simtime_t lifetime = simTime() - clusterHeadStartTime;
@@ -646,7 +673,7 @@
              clusterHeadStartTime = simTime();
              timesAsClusterHead++;
          }
- 
+         
          myState = newState;
  
          trackReclustering();
@@ -657,10 +684,10 @@
  {
      cModule *host = getContainingNode(this);
      if (!host) return;
- 
+     
      static std::map<L3Address, std::string> lastVisualState;
      std::string currentVisual;
- 
+     
      if (myState == STATE_BLACK) {
          host->getDisplayString().setTagArg("i", 1, "red");
          host->getDisplayString().setTagArg("t", 0, "CH");
@@ -674,7 +701,7 @@
          host->getDisplayString().setTagArg("t", 0, "");
          currentVisual = "MEMBER";
      }
-
+     
  }
  
  void DominatingSetAgent::purgeNeighborTable()
@@ -788,7 +815,7 @@
  void DominatingSetAgent::updateClusterMembership()
  {
      L3Address currentClusterHead = findMyClusterHead();
- 
+     
      if (currentClusterHead != myClusterInfo.clusterHead) {
          if (!myClusterInfo.clusterHead.isUnspecified()) {
              myClusterInfo.membershipChanges++;
@@ -802,8 +829,9 @@
  {
      try {
          cModule *host = getContainingNode(const_cast<DominatingSetAgent*>(this));
-         if (!host) return 0.0;
- 
+         if (!host){
+             return 0.0;
+         }
          cModule *energyStorage = host->getSubmodule("energyStorage");
          if (!energyStorage) {
              cModule *wlanModule = host->getSubmodule("wlan", 0);
@@ -814,27 +842,29 @@
                  }
              }
          }
- 
-         if (!energyStorage) return 0.0;
- 
-         double initial = 0.0;
-         double current = 0.0;
- 
-         if (energyStorage->hasPar("initialCapacity")) {
-             initial = energyStorage->par("initialCapacity").doubleValue();
-         } else if (energyStorage->hasPar("nominalCapacity")) {
-             initial = energyStorage->par("nominalCapacity").doubleValue();
+         
+         if (!energyStorage) {
+             return 0.0;
          }
  
-         if (energyStorage->hasPar("capacity")) {
-             current = energyStorage->par("capacity").doubleValue();
-         } else if (energyStorage->hasPar("residualCapacity")) {
-             current = energyStorage->par("residualCapacity").doubleValue();
+         if (auto ep = dynamic_cast<inet::power::IEpEnergyStorage *>(energyStorage)) {
+             double nominalJ = ep->getNominalEnergyCapacity().get();
+             double residualJ = ep->getResidualEnergyCapacity().get();
+             double consumedJ = nominalJ - residualJ;
+             return consumedJ > 0 ? consumedJ : 0.0;
          }
  
-         double consumed = initial - current;
-         return (consumed > 0) ? consumed : 0.0;
+         if (auto cc = dynamic_cast<inet::power::ICcEnergyStorage *>(energyStorage)) {
+             double nominalC = cc->getNominalChargeCapacity().get();
+             double residualC = cc->getResidualChargeCapacity().get();
+             double consumedC = nominalC - residualC;
  
+             double nominalVoltageV = energyStorage->hasPar("nominalVoltage") ? energyStorage->par("nominalVoltage").doubleValue() : 1.0;
+             double consumedJ = consumedC * nominalVoltageV;
+             return consumedJ > 0 ? consumedJ : 0.0;
+         }
+         return 0.0;
+         
      } catch (...) {
          return 0.0;
      }
@@ -845,7 +875,7 @@
      try {
          cModule *host = getContainingNode(const_cast<DominatingSetAgent*>(this));
          if (!host) return true;
- 
+         
          cModule *energyStorage = host->getSubmodule("energyStorage");
          if (!energyStorage) {
              cModule *wlanModule = host->getSubmodule("wlan", 0);
@@ -856,18 +886,19 @@
                  }
              }
          }
- 
+         
          if (!energyStorage) return true;
  
-         double current = 0.0;
-         if (energyStorage->hasPar("capacity")) {
-             current = energyStorage->par("capacity").doubleValue();
-         } else if (energyStorage->hasPar("residualCapacity")) {
-             current = energyStorage->par("residualCapacity").doubleValue();
+         if (auto ep = dynamic_cast<inet::power::IEpEnergyStorage *>(energyStorage)) {
+             return ep->getResidualEnergyCapacity() > inet::power::J(0);
          }
  
-         return current > 0.0;
+         if (auto cc = dynamic_cast<inet::power::ICcEnergyStorage *>(energyStorage)) {
+             return cc->getResidualChargeCapacity() > inet::power::C(0);
+         }
  
+         return true;
+         
      } catch (...) {
          return true;
      }
@@ -879,12 +910,12 @@
      if (myCH.isUnspecified()) {
          return 1;
      }
- 
+     
      int size = 1;
      for (const auto& pair : neighborTable) {
          const L3Address& neighbor = pair.first;
          const NeighborInfo& info = pair.second;
- 
+         
          if (neighbor == myCH || (myState == STATE_BLACK && info.state != STATE_BLACK)) {
              size++;
          }
@@ -895,16 +926,17 @@
  void DominatingSetAgent::trackComputationCost()
  {
      if (lastAlgorithmStartTime > 0) {
-         simtime_t computationTime = simTime() - lastAlgorithmStartTime;
-         emit(computationCostSignal, computationTime.dbl());
+         auto end = std::chrono::high_resolution_clock::now();
+         double computationTime = std::chrono::duration<double, std::milli>(end - algorithmStartWallTime).count();
+         emit(computationCostSignal, computationTime);
      }
  }
  
  void DominatingSetAgent::trackReclustering()
  {
      simtime_t timeSinceLastReclustering = simTime() - lastReclusteringTime;
- 
-     if (previousClusterHead != myClusterInfo.clusterHead &&
+     
+     if (previousClusterHead != myClusterInfo.clusterHead && 
          timeSinceLastReclustering > algorithmInterval) {
          reclusteringCount++;
          lastReclusteringTime = simTime();
@@ -928,10 +960,10 @@
      if (myState == STATE_BLACK) {
          return myAddress;
      }
- 
+     
      L3Address nearestCH;
      int minId = INT_MAX;
- 
+     
      for (const auto& pair : neighborTable) {
          if (pair.second.state == STATE_BLACK) {
              int chId = pair.first.toIpv4().getInt();
@@ -941,7 +973,7 @@
              }
          }
      }
- 
+     
      return nearestCH;
  }
  
